@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone  # ✅ ADDED timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
@@ -62,7 +62,6 @@ class ActivateResponse(BaseModel):
 # ---------- Helpers ----------
 
 def hash_key(raw_key: str) -> str:
-    # Simple hash; you can upgrade to HMAC/argon2 later
     return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
 
 
@@ -119,7 +118,7 @@ def activate(payload: ActivateRequest):
     if lic.key_hash != hash_key(payload.raw_key):
         raise HTTPException(status_code=400, detail="Invalid key for this License ID")
 
-    now = datetime.now(timezone.utc)  # ✅ FIXED: was datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     # First activation
     if lic.first_activation_at is None:
@@ -151,6 +150,57 @@ def activate(payload: ActivateRequest):
         expires_at=lic.expires_at,
         duration_seconds=lic.duration_seconds,
     )
+
+
+# ✅ ---------- NEW: Admin View Endpoints ----------
+
+@app.get("/admin/licenses")
+def view_all_licenses():
+    """View all licenses in database"""
+    db = next(get_db())
+    
+    all_licenses = db.query(License).all()
+    
+    result = []
+    for lic in all_licenses:
+        result.append({
+            "id": lic.id,
+            "license_id": lic.license_id,
+            "duration_seconds": lic.duration_seconds,
+            "first_activation_at": lic.first_activation_at.isoformat() if lic.first_activation_at else None,
+            "expires_at": lic.expires_at.isoformat() if lic.expires_at else None,
+            "machine_fingerprint": lic.machine_fingerprint[:20] + "..." if lic.machine_fingerprint else None,
+            "active": lic.active
+        })
+    
+    return {
+        "total": len(result),
+        "licenses": result
+    }
+
+
+@app.get("/admin/activations")
+def view_activations():
+    """View only activated licenses"""
+    db = next(get_db())
+    
+    activated = db.query(License).filter(License.first_activation_at.isnot(None)).all()
+    
+    result = []
+    for lic in activated:
+        result.append({
+            "license_id": lic.license_id,
+            "activated_at": lic.first_activation_at.isoformat(),
+            "expires_at": lic.expires_at.isoformat() if lic.expires_at else "PERPETUAL",
+            "machine": lic.machine_fingerprint[:20] + "..." if lic.machine_fingerprint else None,
+            "active": lic.active
+        })
+    
+    return {
+        "total_activated": len(result),
+        "activations": result
+    }
+
 
 if __name__ == "__main__":
     import uvicorn
