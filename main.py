@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone  # ✅ ADDED timezone
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
@@ -119,7 +119,7 @@ def activate(payload: ActivateRequest):
     if lic.key_hash != hash_key(payload.raw_key):
         raise HTTPException(status_code=400, detail="Invalid key for this License ID")
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)  # ✅ FIXED: was datetime.utcnow()
 
     # First activation
     if lic.first_activation_at is None:
@@ -155,7 +155,3 @@ def activate(payload: ActivateRequest):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8000)
-
-
-
-
