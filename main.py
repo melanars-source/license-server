@@ -32,7 +32,7 @@ class License(Base):
     machine_fingerprint = Column(String, nullable=True)
     active = Column(Boolean, default=True)
 
-    # NEW: seat-based licensing
+    # seat-based licensing
     max_seats = Column(Integer, nullable=False, default=1)
     used_seats = Column(Integer, nullable=False, default=0)
 
@@ -76,6 +76,16 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+# ---------- Root (healthcheck / keep-alive) ----------
+
+@app.get("/")
+def root():
+    """
+    Simple healthcheck endpoint for cron-job.org or uptime pings.
+    """
+    return {"status": "ok", "message": "License server running"}
 
 
 # ---------- Admin endpoint: register generated license ----------
@@ -191,7 +201,7 @@ def activate(payload: ActivateRequest):
     )
 
 
-# ✅ ---------- NEW: Admin View Endpoints ----------
+# ---------- Admin View Endpoints ----------
 
 @app.get("/admin/licenses")
 def view_all_licenses():
