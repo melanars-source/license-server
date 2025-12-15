@@ -1,20 +1,42 @@
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+import os
+import hashlib
+import secrets
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Security, status
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
-from sqlalchemy import (
-    create_engine, Column, Integer, String, DateTime, Boolean
-)
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-import hashlib
 
-# ---------- DB setup ----------
-DATABASE_URL = "sqlite:///./licenses.db"
+
+# ============================================================
+# Config
+# ============================================================
+
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./licenses.db")
+
+# IMPORTANT: set this in Render environment variables
+# Example (generate locally): python -c "import secrets; print(secrets.token_urlsafe(32))"
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
+
+# Header name used by admin tool (client/admin GUI must send this header)
+ADMIN_API_KEY_HEADER_NAME = "X-Admin-Key"
+
+# Basic brute-force / abuse guard for activation endpoint (very light)
+# This is not a replacement for proper rate limiting at proxy/CDN level.
+ACTIVATE_FAIL_SLEEP_SECONDS = 0.0  # set to e.g. 0.2 if you want tiny slowdown
+
+
+# ============================================================
+# DB setup
+# ============================================================
 
 engine = create_engine(
-    DATABASE_URL, connect_args={"check_same_thread": False}
+    DATABASE_URL,
+    connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -39,16 +61,31 @@ class License(Base):
 
 Base.metadata.create_all(bind=engine)
 
-# ---------- FastAPI app ----------
-app = FastAPI(title="License Server")
 
-# ---------- Schemas ----------
+# ============================================================
+# FastAPI app
+# Optionally disable docs in production by setting:
+#   DISABLE_PUBLIC_DOCS=1
+# ============================================================
+
+disable_public_docs = os.getenv("DISABLE_PUBLIC_DOCS", "0") == "1"
+app = FastAPI(
+    title="License Server",
+    docs_url=None if disable_public_docs else "/docs",
+    redoc_url=None if disable_public_docs else "/redoc",
+    openapi_url=None if disable_public_docs else "/openapi.json",
+)
+
+
+# ============================================================
+# Schemas
+# ============================================================
 
 class LicenseCreate(BaseModel):
     license_id: str
     raw_key: str
     duration_seconds: int  # 0 = perpetual
-    max_seats: int         # NEW
+    max_seats: int
 
 
 class ActivateRequest(BaseModel):
@@ -64,7 +101,9 @@ class ActivateResponse(BaseModel):
     duration_seconds: int
 
 
-# ---------- Helpers ----------
+# ============================================================
+# Helpers
+# ============================================================
 
 def hash_key(raw_key: str) -> str:
     return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
@@ -78,34 +117,57 @@ def get_db():
         db.close()
 
 
-# ---------- Root (healthcheck / keep-alive) ----------
+# --- Admin auth dependency (API key header) ---
+admin_key_header = APIKeyHeader(name=ADMIN_API_KEY_HEADER_NAME, auto_error=False)
+
+def require_admin(api_key: str = Security(admin_key_header)) -> None:
+    """
+    Protects /admin/* endpoints using a single API key in a header.
+    """
+    if not ADMIN_API_KEY:
+        # Misconfiguration: server started without admin key
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Server misconfigured: ADMIN_API_KEY is not set."
+        )
+
+    if not api_key or not secrets.compare_digest(api_key, ADMIN_API_KEY):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized (missing/invalid admin key)."
+        )
+
+
+# ============================================================
+# Root (healthcheck / keep-alive)
+# ============================================================
 
 @app.get("/")
 def root():
-    """
-    Simple healthcheck endpoint for cron-job.org or uptime pings.
-    """
     return {"status": "ok", "message": "License server running"}
 
 
-# ---------- Admin endpoint: register generated license ----------
+# ============================================================
+# Admin endpoint: register generated license (PROTECTED)
+# ============================================================
 
-@app.post("/admin/create", response_model=ActivateResponse)
+@app.post("/admin/create", response_model=ActivateResponse, dependencies=[Depends(require_admin)])
 def admin_create_license(payload: LicenseCreate):
     db = next(get_db())
 
     if payload.max_seats <= 0:
         raise HTTPException(status_code=400, detail="max_seats must be positive")
 
+    if payload.duration_seconds < 0:
+        raise HTTPException(status_code=400, detail="duration_seconds must be >= 0")
+
     existing = db.query(License).filter_by(license_id=payload.license_id).first()
     if existing:
         raise HTTPException(status_code=400, detail="License ID already exists")
 
-    key_hash = hash_key(payload.raw_key)
-
     lic = License(
         license_id=payload.license_id,
-        key_hash=key_hash,
+        key_hash=hash_key(payload.raw_key),
         duration_seconds=payload.duration_seconds,
         max_seats=payload.max_seats,
         used_seats=0
@@ -122,7 +184,9 @@ def admin_create_license(payload: LicenseCreate):
     )
 
 
-# ---------- Client endpoint: first activation / reuse + seats ----------
+# ============================================================
+# Client endpoint: first activation / reuse + seats (PUBLIC)
+# ============================================================
 
 @app.post("/activate", response_model=ActivateResponse)
 def activate(payload: ActivateRequest):
@@ -132,7 +196,7 @@ def activate(payload: ActivateRequest):
     if not lic or not lic.active:
         raise HTTPException(status_code=400, detail="Unknown or inactive license")
 
-    # Check key
+    # Check key hash (server-side)
     if lic.key_hash != hash_key(payload.raw_key):
         raise HTTPException(status_code=400, detail="Invalid key for this License ID")
 
@@ -201,16 +265,17 @@ def activate(payload: ActivateRequest):
     )
 
 
-# ---------- Admin View Endpoints ----------
+# ============================================================
+# Admin View Endpoints (PROTECTED)
+# ============================================================
 
-@app.get("/admin/licenses")
+@app.get("/admin/licenses", dependencies=[Depends(require_admin)])
 def view_all_licenses():
-    """View all licenses in database"""
     db = next(get_db())
 
     all_licenses = db.query(License).all()
-
     result = []
+
     for lic in all_licenses:
         result.append({
             "id": lic.id,
@@ -218,41 +283,34 @@ def view_all_licenses():
             "duration_seconds": lic.duration_seconds,
             "first_activation_at": lic.first_activation_at.isoformat() if lic.first_activation_at else None,
             "expires_at": lic.expires_at.isoformat() if lic.expires_at else None,
-            "machine_fingerprint": lic.machine_fingerprint[:20] + "..." if lic.machine_fingerprint else None,
+            "machine_fingerprint": (lic.machine_fingerprint[:20] + "...") if lic.machine_fingerprint else None,
             "active": lic.active,
             "max_seats": lic.max_seats,
             "used_seats": lic.used_seats,
         })
 
-    return {
-        "total": len(result),
-        "licenses": result
-    }
+    return {"total": len(result), "licenses": result}
 
 
-@app.get("/admin/activations")
+@app.get("/admin/activations", dependencies=[Depends(require_admin)])
 def view_activations():
-    """View only activated licenses"""
     db = next(get_db())
 
     activated = db.query(License).filter(License.first_activation_at.isnot(None)).all()
-
     result = []
+
     for lic in activated:
         result.append({
             "license_id": lic.license_id,
             "activated_at": lic.first_activation_at.isoformat(),
             "expires_at": lic.expires_at.isoformat() if lic.expires_at else "PERPETUAL",
-            "machine": lic.machine_fingerprint[:20] + "..." if lic.machine_fingerprint else None,
+            "machine": (lic.machine_fingerprint[:20] + "...") if lic.machine_fingerprint else None,
             "active": lic.active,
             "max_seats": lic.max_seats,
             "used_seats": lic.used_seats,
         })
 
-    return {
-        "total_activated": len(result),
-        "activations": result
-    }
+    return {"total_activated": len(result), "activations": result}
 
 
 if __name__ == "__main__":
